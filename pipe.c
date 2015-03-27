@@ -6,6 +6,7 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
+#include <linux/list.h>
 
 #define DEV_NAME "pipe"
 
@@ -15,18 +16,21 @@ static ssize_t pipe_write(struct file *, const char __user *, size_t, loff_t *);
 static ssize_t pipe_read(struct file *, char __user *, size_t, loff_t *);
 
 static int major_number;
-static int pipe_write_busy;
-static int pipe_read_busy;
+//static int pipe_write_busy;
+//static int pipe_read_busy;
 static int pipe_buf_size = 2048;
 
-static struct pipe_buf
+struct pipe_buf
 {
+	struct list_head node;
 	int uid;
 	int head;
 	int tail;
 	int count;
 	char *buf;
-} __attribute__ ((__packed__)) curr[2];
+	char pipe_write_busy;
+	char pipe_read_busy;
+};
 
 static const struct file_operations pipe_fops = {
 	.read = pipe_read,
@@ -36,6 +40,8 @@ static const struct file_operations pipe_fops = {
 };
 
 DECLARE_WAIT_QUEUE_HEAD(queue);
+
+static struct pipe_buf *buffers_list;
 
 static int __init init_pipe(void)
 {
@@ -49,66 +55,89 @@ static int __init init_pipe(void)
 
 	pr_info("Started with major number %d\n", major_number);
 
-	curr = kzalloc(sizeof(struct pipe_buf), GFP_KERNEL);
-	curr->buf = kmalloc(sizeof(pipe_buf_size), GFP_KERNEL);
+	buffers_list = kmalloc(sizeof(struct pipe_buf), GFP_KERNEL);
+	INIT_LIST_HEAD(&buffers_list->node);
+	buffers_list->uid = -1;
+	buffers_list->buf = NULL;
 
 	return 0;
 }
 
 static void __exit exit_pipe(void)
 {
-	kfree(curr->buf);
-	kfree(curr);
+	struct pipe_buf *buf_curr;
+	struct list_head *p;
+
+	list_for_each(p, &buffers_list->node) {
+		buf_curr = list_entry(p, struct pipe_buf, node);
+		kfree(buf_curr->buf);
+		list_del(&buf_curr->node);
+		kfree(buf_curr);
+	}
 	unregister_chrdev(major_number, DEV_NAME);
 	pr_info("Unload PIPE driver\n");
 }
 
 static int pipe_open(struct inode *id, struct file *f)
 {
-	struct pipe_buf *tmp;
+	char create_flag = 1;
+	struct pipe_buf *buf_curr;
+	int uid_curr;
+	struct list_head *p;
 
-	pr_info("Opened by %d with mode %x\n",
-		task_pid_nr(current), f->f_flags);
+	uid_curr = current_uid().val;
 
-	if ((f->f_flags & O_ACCMODE) == O_WRONLY) {
-		if (pipe_write_busy == 2) {
-			pr_info("PIPE write busy\n");
-			return -EBUSY;
+	pr_info("Opened PIPE by %d with mode %x by user with UID: %d\n",
+		task_pid_nr(current), f->f_flags, uid_curr);
+
+	list_for_each(p, &buffers_list->node) {
+		buf_curr = list_entry(p, struct pipe_buf, node);
+		if (buf_curr->uid == uid_curr) {
+			create_flag = 0;
+			break;
 		}
-
-		f->private_data = kzalloc(
-			sizeof(struct pipe_buf),
-			GFP_KERNEL);
-		tmp = f->private_data;
-		tmp->buf = kmalloc(sizeof(pipe_buf_size), GFP_KERNEL);
-		tmp->uid = get_current_user()->uid;
-		pipe_write_busy++;
 	}
 
-	if ((f->f_flags & O_ACCMODE) == O_RDONLY) {
-		if (pipe_read_busy == 2) {
-			pr_info("PIPE read busy\n");
-			return -EBUSY;
+	if (create_flag) {
+		buf_curr = kzalloc(sizeof(struct pipe_buf), GFP_KERNEL);
+		buf_curr->buf = kmalloc(sizeof(pipe_buf_size), GFP_KERNEL);
+		buf_curr->uid = uid_curr;
+		INIT_LIST_HEAD(&buf_curr->node);
+		list_add(&buf_curr->node, &buffers_list->node);
+	} else {
+		if ((f->f_flags & O_ACCMODE) == O_WRONLY) {
+			if (buf_curr->pipe_write_busy == 1) {
+				pr_info("PIPE write busy\n");
+				return -EBUSY;
+			}
+			buf_curr->pipe_write_busy = 1;
 		}
 
-		pipe_read_busy++;
+		if ((f->f_flags & O_ACCMODE) == O_RDONLY) {
+			if (buf_curr->pipe_read_busy == 1) {
+				pr_info("PIPE read busy\n");
+				return -EBUSY;
+			}
+			buf_curr->pipe_read_busy = 1;
+		}
 	}
+
+	f->private_data = buf_curr;
 
 	return 0;
 }
 
 static int pipe_release(struct inode *id, struct file *f)
 {
-	/* struct pipe_buf *tmp;
+	struct pipe_buf *tmp;
 
 	tmp = f->private_data;
-	kfree(tmp->buf);
-	kfree(f->private_data); */
+	
 	if ((f->f_flags & O_ACCMODE) == O_WRONLY)
-		pipe_write_busy--;
+		tmp->pipe_write_busy--;
 
 	if ((f->f_flags & O_ACCMODE) == O_RDONLY)
-		pipe_read_busy--;
+		tmp->pipe_read_busy--;
 
 	pr_info("Closed by %d\n", task_pid_nr(current));
 
@@ -122,10 +151,10 @@ static ssize_t pipe_write(
 	loff_t *off
 )
 {
-	/*struct pipe_buf *curr;*/
+	struct pipe_buf *curr;
 	unsigned int free_bytes, bytes_to_copy;
 
-	/*curr = f->private_data;*/
+	curr = f->private_data;
 	free_bytes = pipe_buf_size - curr->count;
 
 	if (sz > free_bytes) {
@@ -161,6 +190,9 @@ static ssize_t pipe_read(
 )
 {
 	unsigned int bytes_to_read, really_sended = 0;
+	struct pipe_buf *curr;
+
+	curr = f->private_data;
 
 	if (curr->count == 0)
 		wait_event_interruptible(queue, curr->count > 0);
