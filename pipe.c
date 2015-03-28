@@ -16,8 +16,6 @@ static ssize_t pipe_write(struct file *, const char __user *, size_t, loff_t *);
 static ssize_t pipe_read(struct file *, char __user *, size_t, loff_t *);
 
 static int major_number;
-//static int pipe_write_busy;
-//static int pipe_read_busy;
 static int pipe_buf_size = 2048;
 
 struct pipe_buf
@@ -71,9 +69,10 @@ static void __exit exit_pipe(void)
 	list_for_each(p, &buffers_list->node) {
 		buf_curr = list_entry(p, struct pipe_buf, node);
 		kfree(buf_curr->buf);
-		list_del(&buf_curr->node);
-		kfree(buf_curr);
+		//list_del(&buf_curr->node);
+		//kfree(buf_curr);
 	}
+	//kfree(buffers_list);
 	unregister_chrdev(major_number, DEV_NAME);
 	pr_info("Unload PIPE driver\n");
 }
@@ -100,7 +99,7 @@ static int pipe_open(struct inode *id, struct file *f)
 
 	if (create_flag) {
 		buf_curr = kzalloc(sizeof(struct pipe_buf), GFP_KERNEL);
-		buf_curr->buf = kmalloc(sizeof(pipe_buf_size), GFP_KERNEL);
+		buf_curr->buf = kmalloc(sizeof(char) * pipe_buf_size, GFP_KERNEL);
 		buf_curr->uid = uid_curr;
 		INIT_LIST_HEAD(&buf_curr->node);
 		list_add(&buf_curr->node, &buffers_list->node);
